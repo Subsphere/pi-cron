@@ -3,16 +3,33 @@
  *
  * A timer started at `session_start` ticks every CHECK_INTERVAL_MS. On each
  * tick we evaluate every loaded job's cron expression against the current
- * minute and dispatch a prompt via `pi.sendUserMessage(...)`. This means jobs
- * fire even when the user isn't actively interacting with pi (true idle), not
- * just after an agent run completes.
+ * minute. When a job is due, we spawn a separate pi process (via the
+ * extension API's safe spawn helper) using that job's own session file. Each
+ * cron task is therefore a fully isolated conversation with its own memory
+ * across runs.
+ *
+ *   tick fires for "morning-brief"
+ *     ↓
+ *   spawn: pi -p -c --session ~/.pi/cron-sessions/morning-brief-abc.jsonl "<prompt>"
+ *     ↓
+ *   subprocess loads yesterday's brief, day-before's, ...
+ *   subprocess runs agent (with full per-task history)
+ *   subprocess writes ~/briefs/today.md (per the prompt's instructions)
+ *   subprocess saves new turn to morning-brief-abc.jsonl
+ *   subprocess exits cleanly (exit 0)
+ *     ↓
+ *   extension records the fire in metadata log
+ *
+ * Your main pi session is never touched. Each cron task is a real,
+ * persistent conversation you can later open interactively via /cron-open.
  *
  * # Trust model
  *
  * Two job sources, with very different trust levels:
  *
  *   - GLOBAL  (~/.pi/cron.d/)        - placed by the user. Trusted. Prompt
- *                                       paths can be ~/, absolute, or relative.
+ *                                       paths can be ~/, absolute, or relative
+ *                                       (resolved against the .cron file's dir).
  *   - LOCAL   (<cwd>/.pi/cron.d/)    - placed by *whoever wrote the repo*.
  *                                       Untrusted. Prompt paths must be
  *                                       repo-relative AND, after symlink
@@ -22,13 +39,28 @@
  *                                       silently exfiltrating it to the LLM
  *                                       provider when the cron fires.
  *
- * # State files
+ * # State files (two distinct kinds)
  *
- * Each job has its own JSONL log under `~/.pi/cron/${name}-${hash}.jsonl`,
- * where `hash` is a short sha256 of the source config file path. This means
- * a global "ping" and a local "ping" never share state - they get separate
- * dedup windows and separate history. The log auto-compacts past
- * MAX_JOB_HISTORY_LINES.
+ *   ~/.pi/cron/${slug}-${hash}.jsonl
+ *     Fire-log metadata (when each job last fired, dispatch history). Local-
+ *     only - never sent to a model. Used for /cron listings + dedup window.
+ *     Auto-compacts past MAX_JOB_HISTORY_LINES.
+ *
+ *   ~/.pi/cron-sessions/${slug}-${hash}.jsonl
+ *     The actual pi session file for this cron task. Same format as your main
+ *     pi session - holds the conversation history that the agent loads on
+ *     each fire. This is real per-task memory.
+ *
+ * `${slug}` is the job's `name` sanitized to filename-safe characters.
+ * `${hash}` is a short sha256 of the .cron config file's path. So a global
+ * "ping" and a local "ping" never collide.
+ *
+ * # Recursion guard
+ *
+ * The subprocess pi we spawn would itself try to load this extension and
+ * start scheduling. To prevent infinite recursion, we set
+ * `PI_CRON_SUBPROCESS=1` in the subprocess env. The extension's session_start
+ * handler checks for this and skips scheduling if set.
  *
  * # Cron config files
  *
@@ -41,31 +73,13 @@
  *
  * Cron format: minute hour day-of-month month day-of-week
  *   Field tokens: *, *\/N, N, N-N, N-N/N, N,M
+ *   POSIX semantics: DOW 7 = 0 (Sunday); DOM/DOW use OR when both restricted.
  *
  * # Slash commands
  *
- *   /cron            - List registered jobs (with source, last-fired, depth)
- *   /cron-remove N   - Remove a job in-memory (returns on next session start)
- *
- * # Context budget (notification only)
- *
- * After each cron fire, the extension checks pi's session usage. If usage
- * exceeds DEFAULT_MAX_CONTEXT_TOKENS (100K by default) it WARNS the user.
- * It does not auto-compact, because pi's compaction is governed by the
- * `keepRecentTokens` setting (default 20K) and extensions can't override it
- * per-call. Auto-compacting would shrink the session to ~25-30K, losing more
- * context than the user wanted to keep.
- *
- * To use the cap effectively: set `compaction.keepRecentTokens: 80000` in
- * your pi settings, then run /compact yourself when the cron warns you. The
- * compacted session will land at ~80K, in your target range.
- *
- * Set DEFAULT_MAX_CONTEXT_TOKENS to 0 to disable the warning.
- *
- * Note that the per-task `~/.pi/cron/${name}-${hash}.jsonl` log is purely
- * local metadata (last-fired times, fire history). It is NEVER sent to the
- * model. The only thing each cron fire adds to the model context is the
- * prompt file's contents.
+ *   /cron               - List registered jobs (source, last-fired, depth)
+ *   /cron-remove <name> - Remove a job in-memory (returns on next session start)
+ *   /cron-open <name>   - Print the command to open a task's session interactively
  */
 
 import { createHash } from "node:crypto";
@@ -335,6 +349,29 @@ export function getJobSessionPath(job: JobIdentity, baseDir: string = DEFAULT_ST
 	const rel = relative(baseDir, candidate);
 	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
 		throw new Error(`cron state path escaped baseDir (job.name="${job.name}", candidate=${candidate})`);
+	}
+	return candidate;
+}
+
+/**
+ * Default directory for per-task pi session files. Distinct from DEFAULT_STATE_DIR
+ * (which holds metadata-only fire logs). Each task's session file is a real pi
+ * conversation - same .jsonl format as your interactive sessions - that the cron
+ * subprocess loads and continues on each fire.
+ */
+const DEFAULT_SESSION_DIR = join(homedir() || "", ".pi", "cron-sessions");
+
+/**
+ * Path to the per-task pi session file. Same name+hash slug as the fire log,
+ * different directory. Containment-checked the same way to defeat a malicious
+ * job-name traversal.
+ */
+export function getTaskSessionPath(job: JobIdentity, baseDir: string = DEFAULT_SESSION_DIR): string {
+	const filename = `${safeNameSlug(job.name)}-${configHash(job.configFile)}.jsonl`;
+	const candidate = join(baseDir, filename);
+	const rel = relative(baseDir, candidate);
+	if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+		throw new Error(`cron task session path escaped baseDir (job.name="${job.name}", candidate=${candidate})`);
 	}
 	return candidate;
 }
@@ -637,10 +674,41 @@ export function prepareCronDispatch(job: CronJob, cwdDir: string, homeDir: strin
 }
 
 // ============================================================================
+// Subprocess args (pure helper - testable)
+// ============================================================================
+
+/**
+ * Build the argv for spawning a pi subprocess to run a cron task.
+ *
+ * Layout:
+ *   pi --no-extensions -p -c --session <task-session> "<tagged-prompt>"
+ *
+ * Flag-by-flag rationale:
+ *   --no-extensions  prevents the spawned pi from auto-loading THIS extension
+ *                    and recursing. Built-in tools (bash, write, edit, read)
+ *                    still work, which covers all realistic cron use cases.
+ *   -p               print mode: process the prompt, write response to stdout,
+ *                    exit. The cron extension itself ignores stdout - the
+ *                    cron's prompt is responsible for any side effects (file
+ *                    writes, curl, etc.). This is what keeps the user's main
+ *                    TUI undisturbed.
+ *   -c               continue the session at --session: load prior turns into
+ *                    context. This is what gives each cron task its own real
+ *                    persistent memory across runs.
+ *   --session <path> the per-task session file. Each cron task has its own.
+ *
+ * The prompt content is passed as the last positional arg.
+ */
+export function buildSubprocessArgs(taskSessionPath: string, taggedPrompt: string): string[] {
+	return ["--no-extensions", "-p", "-c", "--session", taskSessionPath, taggedPrompt];
+}
+
+// ============================================================================
 // Extension entry point
 // ============================================================================
 
 const CHECK_INTERVAL_MS = 60_000;
+const SUBPROCESS_TIMEOUT_MS = 10 * 60 * 1000; // 10 min: kills hung subprocess so the next tick can retry
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	let jobs: CronJob[] = [];
@@ -648,71 +716,74 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let cwdDir = process.cwd();
 	let extensionLoadMs = Date.now();
+	let isCheckRunning = false;
 	const homeDir = homedir() || "";
 	const stateDir = join(homeDir, ".pi", "cron");
+	const sessionDir = join(homeDir, ".pi", "cron-sessions");
 
 	/**
-	 * Dispatch a single due job for the given matched minute. Returns true if a
-	 * sendUserMessage call was made.
+	 * Dispatch a single due job by spawning a pi subprocess on the job's own
+	 * per-task session file. Returns true iff the subprocess exited 0 AND we
+	 * persisted the fire log.
 	 *
-	 * `matchedAt` is the wall-clock minute the cron expression matched - it may
-	 * be earlier than `Date.now()` if we're catching up after a sleep/wake or
-	 * delayed tick. The persisted fire timestamp is `Date.now()` (real wall
-	 * clock when we dispatched), so dedup uses real elapsed time.
+	 * Ordering rule: we persist the fire AFTER the subprocess exits 0. If the
+	 * subprocess fails (non-zero exit, throw, timeout), we do NOT persist.
+	 * Next tick will retry within the dedup window. For sparse schedules
+	 * (daily) the catch-up logic handles the retry.
 	 *
-	 * Crash safety: the caller wraps this in try/catch so any unforeseen throw
-	 * just aborts this one job and notifies the user, instead of escaping the
-	 * setInterval callback.
-	 *
-	 * Send-then-persist ordering: we ONLY append to the fire log after
-	 * sendUserMessage returns without throwing. If delivery fails, the job
-	 * stays "not fired" and the next tick will retry. This matters for daily
-	 * crons where a missed window is invisible to the user otherwise.
-	 *
-	 * State-persist failure is treated as a soft warning - the message was
-	 * already delivered, so the only consequence is that the next tick may
-	 * re-fire (better than silently missing).
+	 * Crash safety: the outer checkAndFireJobs wraps this in try/catch so any
+	 * unforeseen throw never escapes the setInterval callback.
 	 */
-	function fireOneJob(job: CronJob, matchedAt: Date, ctx: ExtensionContext, alreadyDispatched: boolean): boolean {
-		// Note: the caller (checkAndFireJobs) has already determined this job is
-		// due via findMostRecentDueMinute, which encapsulates dedup + lookback.
-		// We don't re-check shouldFire here.
-		void matchedAt; // currently used only for the notify message; keep for future logging
-
-		// Preflight: skip if no model is configured. sendUserMessage is fire-
-		// and-forget, so without this preflight a missing model would cause
-		// the cron to be silently logged as fired despite the message never
-		// reaching an LLM. This catches the most common configuration-error
-		// case; the broader API limitation is documented above.
-		if (!ctx.model) {
-			if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": skipped (no model selected)`, "warning");
-			return false;
-		}
-
+	async function fireOneJob(job: CronJob, matchedAt: Date, ctx: ExtensionContext): Promise<boolean> {
 		const prep = prepareCronDispatch(job, cwdDir, homeDir);
 		if (!prep.ok) {
 			if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": ${prep.reason}`, "error");
 			return false;
 		}
 
-		// Send first - if this throws we want to NOT have persisted the fire.
-		//
-		// LIMITATION: pi.sendUserMessage(...) returns void and is fire-and-
-		// forget at the API level. We catch synchronous throws (e.g. "agent
-		// busy" rejections) by NOT persisting the fire if this call throws.
-		// But asynchronous failures (rate-limit, auth error, network failure
-		// after queueing) are not visible here - the user message was queued
-		// but may never reach the model. A complete fix needs a pending-state
-		// log plus correlation against a delivery-confirmation event; out of
-		// scope for this example extension.
-		if (!alreadyDispatched && ctx.isIdle()) {
-			pi.sendUserMessage(prep.tagged);
-		} else {
-			pi.sendUserMessage(prep.tagged, { deliverAs: "followUp" });
+		const taskSessionPath = getTaskSessionPath(job, sessionDir);
+		try {
+			mkdirSync(dirname(taskSessionPath), { recursive: true });
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": cannot create session dir: ${msg}`, "error");
+			return false;
 		}
 
-		// Persist fire history (best effort - if state dir is unwritable we still
-		// notify but consider the job dispatched, since the message went out).
+		const args = buildSubprocessArgs(taskSessionPath, prep.tagged);
+
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Cron firing: ${job.name} [${job.source}] for ${matchedAt.toISOString()}`, "info");
+		}
+
+		let result: { stdout: string; stderr: string; code: number; killed: boolean };
+		try {
+			result = await pi.exec("pi", args, {
+				cwd: cwdDir,
+				signal: ctx.signal,
+				timeout: SUBPROCESS_TIMEOUT_MS,
+			});
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": spawn threw: ${msg}`, "error");
+			return false;
+		}
+
+		if (result.killed) {
+			if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": subprocess killed (timeout or abort)`, "warning");
+			return false;
+		}
+
+		if (result.code !== 0) {
+			const stderrSnip = (result.stderr || "(empty)").slice(0, 500).trim();
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Cron "${job.name}": pi exited ${result.code}. stderr: ${stderrSnip}`, "error");
+			}
+			return false;
+		}
+
+		// Subprocess succeeded. Persist the fire log so dedup engages and
+		// /cron listings show this run.
 		try {
 			compactJobHistory(job, stateDir);
 			appendJobMessage(job, prep.promptContent, stateDir);
@@ -723,73 +794,79 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			}
 		}
 
-		// Context cap: WARN, don't auto-compact.
-		//
-		// pi's compaction is governed by the `keepRecentTokens` setting (default
-		// 20K). The extension API does NOT let us override that per-call - the
-		// `customInstructions` option only shapes the summary text, not the cut
-		// point. So if we called ctx.compact() here when the user's pi settings
-		// still default to 20K, we'd shrink their session to ~25-30K and lose
-		// most of the context they wanted to keep.
-		//
-		// Instead we just notify when usage exceeds the cap. The user can then:
-		//   (a) raise pi's `keepRecentTokens` (e.g. 80000) in settings, then
-		//   (b) run /compact themselves when convenient - the result lands in
-		//       their target range.
-		//
-		// pi's own autocompactor also fires near the context-window edge, so a
-		// runaway session is never load-bearing on this notification.
-		const usage = ctx.getContextUsage();
-		if (shouldCompactContext(usage, DEFAULT_MAX_CONTEXT_TOKENS) && ctx.hasUI) {
-			ctx.ui.notify(
-				`Cron: pi session at ${usage?.tokens}/${usage?.contextWindow} tokens, over your ${DEFAULT_MAX_CONTEXT_TOKENS} cap. Set 'compaction.keepRecentTokens: 80000' in pi settings, then /compact when convenient.`,
-				"warning",
-			);
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Cron fired: ${job.description || job.name} [${job.source}]`, "info");
 		}
-
-		if (ctx.hasUI) ctx.ui.notify(`Cron fired: ${job.description || job.name} [${job.source}]`, "info");
 		return true;
 	}
 
-	function checkAndFireJobs(): void {
-		const ctx = lastCtx;
-		if (!ctx) return;
-		const now = new Date();
-		let dispatchedThisTick = false;
-		for (const job of jobs) {
-			try {
-				const lastFire = getLastFireTime(job, stateDir);
-				const matchedAt = findMostRecentDueMinute(job, now, lastFire, extensionLoadMs);
-				if (!matchedAt) continue;
-				if (fireOneJob(job, matchedAt, ctx, dispatchedThisTick)) {
-					dispatchedThisTick = true;
+	/**
+	 * One scheduler tick. Iterates all jobs, awaiting each subprocess
+	 * sequentially. Re-entry guard: if a previous tick is still running (e.g.,
+	 * a cron job took 90 seconds), the next tick is skipped entirely.
+	 */
+	async function checkAndFireJobs(): Promise<void> {
+		if (isCheckRunning) return;
+		isCheckRunning = true;
+		try {
+			const ctx = lastCtx;
+			if (!ctx) return;
+			const now = new Date();
+			for (const job of jobs) {
+				try {
+					const lastFire = getLastFireTime(job, stateDir);
+					const matchedAt = findMostRecentDueMinute(job, now, lastFire, extensionLoadMs);
+					if (!matchedAt) continue;
+					await fireOneJob(job, matchedAt, ctx);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": dispatch failed: ${msg}`, "error");
 				}
-			} catch (err) {
-				// Per-job try/catch so any throw - readFileSync against a special
-				// file, sendUserMessage rejection, anything - is contained to this
-				// one job and never escapes the setInterval callback.
-				const msg = err instanceof Error ? err.message : String(err);
-				if (ctx.hasUI) ctx.ui.notify(`Cron "${job.name}": dispatch failed: ${msg}`, "error");
 			}
+		} finally {
+			isCheckRunning = false;
 		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
+
+		// Recursion guard. Two complementary protections, either alone is
+		// sufficient. Belt-and-suspenders because the cost of an infinite
+		// recursive spawn is severe.
+		//
+		//   1. We pass --no-extensions when spawning, so the subprocess does
+		//      not load this extension at all (primary defense).
+		//   2. PI_CRON_SUBPROCESS=1 in the env. The extension API doesn't let
+		//      us set env via pi.exec, so this only fires for the
+		//      pi-cron-runner CLI (which uses node:child_process directly).
+		//      It also catches manual reproduction (`PI_CRON_SUBPROCESS=1
+		//      pi`) and any future code path that wants to opt out.
+		//
+		// If we are inside a subprocess, do nothing - no jobs loaded, no timer
+		// started. The subprocess just runs its prompt and exits.
+		if (process.env.PI_CRON_SUBPROCESS === "1") {
+			return;
+		}
+
 		cwdDir = ctx.cwd;
 		extensionLoadMs = Date.now();
 		jobs = loadAllJobs(homeDir, cwdDir);
 
 		if (timer) clearInterval(timer);
-		timer = setInterval(checkAndFireJobs, CHECK_INTERVAL_MS);
+		// setInterval ignores returned promises - which is fine because we have
+		// our own re-entry guard via isCheckRunning. The scheduler ticks every
+		// CHECK_INTERVAL_MS regardless of whether the previous tick finished.
+		timer = setInterval(() => {
+			void checkAndFireJobs();
+		}, CHECK_INTERVAL_MS);
 		// We do NOT call checkAndFireJobs() here. Earlier versions did to "catch
 		// up" jobs whose matching minute coincided with session_start, but in
-		// practice that races with pi's own user-message dispatch (especially in
-		// print mode where the user prompt is in flight at session_start) and
-		// produces "Agent is already processing" errors. The first timer tick
-		// lands within ≤60s, and findMostRecentDueMinute will catch up any
-		// matching minute that drifted past session_start - so this delay
-		// doesn't lose schedules, it just defers the first fire by a minute.
+		// print mode this races with pi's own user-message dispatch. The first
+		// timer tick lands within ≤60s, and findMostRecentDueMinute will catch
+		// up any matching minute that drifted past session_start - so this
+		// delay doesn't lose schedules, it just defers the first fire by ≤1
+		// minute.
 
 		if (ctx.hasUI) {
 			const globalCount = jobs.filter((j) => j.source === "global").length;
@@ -830,7 +907,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 
 	pi.registerCommand("cron", {
-		description: "List registered cron jobs (with source, last-fired, history depth)",
+		description: "List registered cron jobs (source, schedule, last-fired, fire count, session file presence)",
 		handler: async (_args, ctx) => {
 			if (jobs.length === 0) {
 				ctx.ui.notify("No cron jobs. Add .cron files to ~/.pi/cron.d/ or .pi/cron.d/", "warning");
@@ -842,16 +919,43 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				const when = last ? new Date(last).toLocaleString() : "never";
 				const depth = getJobEntryCount(job, stateDir);
 				const desc = job.description ? ` - ${job.description}` : "";
+				const taskSession = getTaskSessionPath(job, sessionDir);
+				const sessionExists = existsSync(taskSession) ? "✓" : "✗";
 				lines.push(
-					`[${job.source}] ${job.name}  cron: ${job.cronExpression}${desc}  (last: ${when}, ${depth} entries)`,
+					`[${job.source}] ${job.name}  cron: ${job.cronExpression}${desc}  (last: ${when}, ${depth} fires, session: ${sessionExists})`,
 				);
 			}
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 
+	pi.registerCommand("cron-open", {
+		description: "Print the command to open a cron task's session interactively",
+		handler: async (args, ctx) => {
+			const name = args.trim();
+			if (!name) {
+				ctx.ui.notify("Usage: /cron-open <job-name>", "warning");
+				return;
+			}
+			const job = jobs.find((j) => j.name === name);
+			if (!job) {
+				ctx.ui.notify(`Job "${name}" not found`, "error");
+				return;
+			}
+			const taskSession = getTaskSessionPath(job, sessionDir);
+			if (!existsSync(taskSession)) {
+				ctx.ui.notify(`Session file does not exist yet (job hasn't fired): ${taskSession}`, "warning");
+				return;
+			}
+			ctx.ui.notify(
+				`To open this cron's session interactively, run in a new terminal:\n\n  pi --session ${taskSession}\n\nThe session contains the full conversation history accumulated across cron fires.`,
+				"info",
+			);
+		},
+	});
+
 	pi.registerCommand("cron-remove", {
-		description: "Remove a cron job in-memory (config file remains on disk)",
+		description: "Remove a cron job in-memory (config file remains on disk; clears fire log + per-task session)",
 		handler: async (args, ctx) => {
 			const name = args.trim();
 			if (!name) {
@@ -866,15 +970,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const job = jobs[idx];
 			jobs.splice(idx, 1);
 
-			const sessionFile = getJobSessionPath(job, stateDir);
-			if (existsSync(sessionFile)) {
+			// Clear the fire-log metadata.
+			const fireLog = getJobSessionPath(job, stateDir);
+			if (existsSync(fireLog)) {
 				try {
-					writeFileSync(sessionFile, "");
+					writeFileSync(fireLog, "");
 				} catch {
 					/* ignore */
 				}
 			}
-			ctx.ui.notify(`Removed cron job: ${name} [${job.source}] (session file cleared)`, "info");
+			// Note: we deliberately do NOT delete the per-task session file
+			// (sessionDir/<slug>.jsonl). That contains the actual conversation
+			// history the user might still want to read. Removing the cron job
+			// config doesn't delete the chat. The user can rm it manually if
+			// they want a clean slate.
+			ctx.ui.notify(
+				`Removed cron job: ${name} [${job.source}]. Fire log cleared. Per-task session file (${getTaskSessionPath(job, sessionDir)}) preserved - delete manually if you want a clean slate.`,
+				"info",
+			);
 		},
 	});
 }

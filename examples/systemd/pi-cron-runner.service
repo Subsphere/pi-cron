@@ -1,0 +1,30 @@
+[Unit]
+Description=pi-cron one-shot runner (fires due cron jobs, exits)
+Documentation=https://github.com/Subsphere/pi-cron
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust to your install path. If you `npm install -g pi-cron`, the binary
+# typically lands at /usr/local/bin/pi-cron-runner or ~/.npm-global/bin/.
+ExecStart=/usr/local/bin/pi-cron-runner
+
+# Run as your user (not root) so ~/.pi/ resolves correctly. Replace `pi-user`
+# with your actual user. If running as root for some reason, comment out User=
+# and the runner will use root's $HOME.
+User=pi-user
+Group=pi-user
+
+# Reasonable defaults for a one-shot LLM dispatcher.
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min
+Nice=10
+
+# Hardening (defense in depth, optional but recommended).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-write
+ReadWritePaths=/home/pi-user/.pi

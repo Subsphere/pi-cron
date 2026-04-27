@@ -1,11 +1,6 @@
 /**
  * Tests for cron.ts. Standalone version of the in-tree test suite.
  *
- * Layered:
- *  - pure-function units (parser, dedup, persistence, compaction, path safety)
- *  - end-to-end firing simulation that doesn't wait for setInterval ticks
- *  - end-to-end SECURITY simulation (malicious local .cron blocked)
- *
  * Integration tests against pi's runner live in pi-mono - they need pi
  * internals that aren't published from @mariozechner/pi-coding-agent.
  */
@@ -17,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ContextUsage } from "@mariozechner/pi-coding-agent";
 import {
 	appendJobMessage,
+	buildSubprocessArgs,
 	type CronJob,
 	compactJobHistory,
 	configHash,
@@ -27,6 +23,7 @@ import {
 	getJobEntryCount,
 	getJobSessionPath,
 	getLastFireTime,
+	getTaskSessionPath,
 	isReadableRegularFile,
 	type JobEntry,
 	type JobIdentity,
@@ -420,6 +417,83 @@ describe("getJobSessionPath — containment guarantee", () => {
 		const a = getJobSessionPath(id("../../a", "/c.cron"), "/state");
 		const b = getJobSessionPath(id("../../b", "/c.cron"), "/state");
 		expect(a).not.toBe(b);
+	});
+});
+
+// =============================================================================
+// getTaskSessionPath — per-task session file (real conversation memory)
+// =============================================================================
+
+describe("getTaskSessionPath", () => {
+	it("uses the task-session baseDir, distinct from the fire-log baseDir", () => {
+		const job = id("foo", "/etc/x.cron");
+		const taskPath = getTaskSessionPath(job, "/sessions");
+		const firePath = getJobSessionPath(job, "/firelog");
+		expect(path.dirname(taskPath)).toBe("/sessions");
+		expect(path.dirname(firePath)).toBe("/firelog");
+		// Same name+hash slug — only the directory differs.
+		expect(path.basename(taskPath)).toBe(path.basename(firePath));
+	});
+
+	it("a malicious job NAME cannot escape the session dir", () => {
+		const baseDir = "/sessions";
+		const malicious = id("../../etc/passwd", "/c.cron");
+		const p = getTaskSessionPath(malicious, baseDir);
+		expect(path.dirname(p)).toBe(baseDir);
+		expect(path.basename(p)).not.toMatch(/\.\./);
+		expect(path.basename(p)).not.toContain("/");
+	});
+
+	it("two jobs with same name but different configFile get distinct task sessions", () => {
+		const a = getTaskSessionPath(id("ping", "/global/ping.cron"), "/sessions");
+		const b = getTaskSessionPath(id("ping", "/local/ping.cron"), "/sessions");
+		expect(a).not.toBe(b);
+	});
+});
+
+// =============================================================================
+// buildSubprocessArgs — subprocess invocation contract
+// =============================================================================
+
+describe("buildSubprocessArgs", () => {
+	const args = buildSubprocessArgs("/path/to/morning-brief.jsonl", "[cron: morning-brief]\nDo X");
+
+	it("passes --no-extensions as the recursion guard", () => {
+		// Without this, the spawned pi would auto-load THIS extension and start
+		// scheduling, which would spawn another pi, infinite recursion.
+		expect(args).toContain("--no-extensions");
+	});
+
+	it("includes -p for print mode (one prompt, then exit)", () => {
+		expect(args).toContain("-p");
+	});
+
+	it("includes -c to continue the per-task session", () => {
+		// -c means: load the existing conversation history from --session
+		// before processing the new prompt. This is what gives each cron task
+		// real persistent memory across runs.
+		expect(args).toContain("-c");
+	});
+
+	it("includes --session immediately followed by the per-task session path", () => {
+		const sessionIdx = args.indexOf("--session");
+		expect(sessionIdx).toBeGreaterThanOrEqual(0);
+		expect(args[sessionIdx + 1]).toBe("/path/to/morning-brief.jsonl");
+	});
+
+	it("the prompt content is the very last argument", () => {
+		expect(args[args.length - 1]).toBe("[cron: morning-brief]\nDo X");
+	});
+
+	it("does NOT shell-escape or quote the prompt — pi.exec uses spawn(shell:false)", () => {
+		// Critical for security: we rely on spawn(shell:false) to pass the
+		// prompt as a single argv element without shell interpretation. If we
+		// ever wrapped this in quotes or escapes, a prompt containing $(rm -rf)
+		// could be misinterpreted. As-is, child_process.spawn passes argv
+		// directly via execve, no shell parsing.
+		const tricky = `'; rm -rf /; echo '`;
+		const a = buildSubprocessArgs("/p", tricky);
+		expect(a[a.length - 1]).toBe(tricky);
 	});
 });
 
@@ -1071,13 +1145,15 @@ describe("prepareCronDispatch", () => {
 // throws, fire history must NOT be persisted, so the next tick can retry.
 // =============================================================================
 
-describe("send-then-persist ordering", () => {
+describe("spawn-then-persist ordering (subprocess dispatch model)", () => {
 	let cwd: string;
 	let stateDir: string;
+	let sessionDir: string;
 	let job: CronJob;
 	beforeEach(() => {
 		cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "cron-stp-cwd-")));
 		stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cron-stp-state-"));
+		sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "cron-stp-session-"));
 		fs.writeFileSync(path.join(cwd, "p.md"), "do the thing");
 		job = makeJob({
 			name: "stp",
@@ -1087,46 +1163,78 @@ describe("send-then-persist ordering", () => {
 		});
 	});
 	afterEach(() => {
-		for (const d of [cwd, stateDir]) fs.rmSync(d, { recursive: true, force: true });
+		for (const d of [cwd, stateDir, sessionDir]) fs.rmSync(d, { recursive: true, force: true });
 	});
 
 	/**
-	 * Simulates the dispatch ordering used by fireOneJob: prepare → send → persist.
-	 * If the supplied send function throws, persist must NOT happen.
+	 * Simulates the dispatch ordering used by fireOneJob:
+	 *   prepare → buildArgs → spawn pi subprocess → on exit 0, persist fire log.
+	 * The supplied `spawn` function stands in for pi.exec.
 	 */
-	function dispatch(sendUserMessage: (content: string) => void): { sent: boolean; threw?: string } {
+	function dispatchTick(spawn: (args: string[]) => { code: number; stderr?: string }): {
+		fired: boolean;
+		argsSeen?: string[];
+		exitCode?: number;
+		threw?: string;
+	} {
 		const prep = prepareCronDispatch(job, cwd, "/nope-no-home");
-		if (!prep.ok) return { sent: false };
+		if (!prep.ok) return { fired: false };
+		const taskSessionPath = getTaskSessionPath(job, sessionDir);
+		const args = buildSubprocessArgs(taskSessionPath, prep.tagged);
+		let result: { code: number; stderr?: string };
 		try {
-			sendUserMessage(prep.tagged);
-			appendJobMessage(job, prep.promptContent, stateDir);
-			return { sent: true };
+			result = spawn(args);
 		} catch (err) {
-			return { sent: false, threw: err instanceof Error ? err.message : String(err) };
+			return {
+				fired: false,
+				argsSeen: args,
+				threw: err instanceof Error ? err.message : String(err),
+			};
 		}
+		if (result.code !== 0) {
+			return { fired: false, argsSeen: args, exitCode: result.code };
+		}
+		appendJobMessage(job, prep.promptContent, stateDir);
+		return { fired: true, argsSeen: args, exitCode: 0 };
 	}
 
-	it("appends fire history when send succeeds", () => {
+	it("appends fire log when subprocess exits 0", () => {
 		expect(getJobEntryCount(job, stateDir)).toBe(0);
-		const r = dispatch(() => {
-			/* succeeds */
-		});
-		expect(r.sent).toBe(true);
+		const r = dispatchTick(() => ({ code: 0 }));
+		expect(r.fired).toBe(true);
 		expect(getJobEntryCount(job, stateDir)).toBe(1);
 	});
 
-	it("does NOT append fire history when send throws", () => {
+	it("does NOT append fire log when subprocess exits non-zero", () => {
 		expect(getJobEntryCount(job, stateDir)).toBe(0);
-		const r = dispatch(() => {
-			throw new Error("delivery rejected: agent busy");
-		});
-		expect(r.sent).toBe(false);
-		expect(r.threw).toMatch(/delivery rejected/);
-		// Critical assertion: no fire was persisted, so getLastFireTime is null,
-		// so shouldFire on the next tick will fire again. Without this ordering,
-		// the daily cron would silently miss its window.
+		const r = dispatchTick(() => ({ code: 1, stderr: "model not configured" }));
+		expect(r.fired).toBe(false);
+		expect(r.exitCode).toBe(1);
+		// Critical: no fire was persisted, so getLastFireTime is null, so the
+		// next catch-up tick will retry. For daily crons where missing the
+		// window means missing the day, this is the difference between
+		// "delivery silently dropped" and "delivery retried".
 		expect(getJobEntryCount(job, stateDir)).toBe(0);
 		expect(getLastFireTime(job, stateDir)).toBeNull();
+	});
+
+	it("does NOT append fire log when spawn throws", () => {
+		const r = dispatchTick(() => {
+			throw new Error("ENOENT: pi binary not found in PATH");
+		});
+		expect(r.fired).toBe(false);
+		expect(r.threw).toMatch(/ENOENT/);
+		expect(getJobEntryCount(job, stateDir)).toBe(0);
+		expect(getLastFireTime(job, stateDir)).toBeNull();
+	});
+
+	it("subprocess args contain the task-session path and the tagged prompt", () => {
+		const r = dispatchTick(() => ({ code: 0 }));
+		const args = r.argsSeen!;
+		const sessionIdx = args.indexOf("--session");
+		expect(args[sessionIdx + 1]).toBe(getTaskSessionPath(job, sessionDir));
+		expect(args[args.length - 1]).toBe("[cron: stp]\ndo the thing");
+		expect(args).toContain("--no-extensions");
 	});
 });
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Trigger pi-cron-runner once per minute
+
+[Timer]
+# Fire every minute on the minute. The runner itself decides whether any cron
+# job is actually due — most ticks will exit silently with "0 fired".
+OnCalendar=*:0/1
+# Catch up missed schedules after a reboot or systemd downtime. Combined with
+# the runner's findMostRecentDueMinute lookback, daily crons survive overnight
+# VM reboots.
+Persistent=true
+# Slight randomized delay so a thundering herd of VMs running the same setup
+# doesn't all hit the LLM provider at exactly :00.
+RandomizedDelaySec=15
+
+[Install]
+WantedBy=timers.target
