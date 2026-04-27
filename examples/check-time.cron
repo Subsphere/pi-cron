@@ -1,0 +1,4 @@
+name: check-time
+prompt: ~/.pi/cron-prompts/check-time.md
+cron: */5 * * * *
+description: Demo job that asks for the current time every 5 minutes

@@ -1,0 +1,48 @@
+{
+	"name": "pi-cron",
+	"version": "0.1.0",
+	"description": "Schedule prompts to fire on a wall-clock interval, even when pi is idle. Fires through pi.sendUserMessage so each prompt becomes a normal user message in your pi session.",
+	"type": "module",
+	"keywords": [
+		"pi",
+		"pi-coding-agent",
+		"extension",
+		"cron",
+		"scheduler",
+		"llm"
+	],
+	"license": "MIT",
+	"author": "Subsphere",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Subsphere/pi-cron.git"
+	},
+	"bugs": {
+		"url": "https://github.com/Subsphere/pi-cron/issues"
+	},
+	"homepage": "https://github.com/Subsphere/pi-cron#readme",
+	"pi": {
+		"extensions": [
+			"./cron.ts"
+		]
+	},
+	"files": [
+		"cron.ts",
+		"README.md",
+		"LICENSE",
+		"examples"
+	],
+	"scripts": {
+		"test": "vitest --run",
+		"test:watch": "vitest"
+	},
+	"peerDependencies": {
+		"@mariozechner/pi-coding-agent": "^0.70.0"
+	},
+	"devDependencies": {
+		"@mariozechner/pi-coding-agent": "^0.70.2",
+		"@types/node": "^22.10.5",
+		"typescript": "^5.7.0",
+		"vitest": "^3.2.4"
+	}
+}
