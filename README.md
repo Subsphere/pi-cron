@@ -171,12 +171,25 @@ If you don't care about the cap, set `DEFAULT_MAX_CONTEXT_TOKENS = 0` at the top
 
 ---
 
+## Catch-up behavior (sleep / wake / late open)
+
+The scheduler is **catch-up aware**. Instead of only checking the current minute when each tick fires, it walks backwards from `now` looking for the most recent matching minute that hasn't already been fired. This handles:
+
+- **Open pi at 12:00:05** — a `0 12 * * *` cron still fires at 12:00 (within the 5-minute first-time lookback).
+- **Laptop sleep 12:30 → 14:00** — a `0 13 * * *` cron fires at 13:00 on the next tick after wake (within the 24-hour previously-fired lookback).
+- **Frequent crons during a long sleep** — a `* * * * *` cron sleeping for 30 minutes fires once at the most-recent matching minute, not 30 times.
+
+Caps:
+- Never-fired job lookback: **5 minutes** (and never before extension load — no surprise stale fires)
+- Previously-fired job lookback: **24 hours** (covers daily crons across overnight sleep)
+- A 48h+ sleep with a daily cron will still miss the day before last — documented behavior, not a bug
+
 ## Limitations
 
-- **Wall-clock fires only when pi is running.** No daemon, no background process. If pi is closed, no cron fires. (Pi's session_start handler picks up missed schedules in the next matching minute when you re-open.)
+- **Wall-clock fires only when pi is running.** No daemon, no background process. If pi is closed for longer than the 24h lookback, that schedule is missed.
 - **`pi.sendUserMessage` is fire-and-forget.** The extension catches synchronous throws (e.g. "agent busy" rejections), so a failed dispatch does NOT mark the job as fired and the next tick retries. But asynchronous failures past queueing (rate limits, model auth errors, network failures) are invisible at the API level — the job appears fired. For one-shot daily SLAs, prefer to verify via `/cron` listing + manual check.
 - **The cron's prompt goes into pi's main session, not an isolated conversation.** If you want truly isolated per-task chats, that's an architectural change beyond this extension (would need session forking + correlation).
-- **The setInterval runs in pi's event loop.** Pi has to be foregrounded for ticks to fire on time. If the OS suspends the process, the next tick after wake-up catches up.
+- **No multi-process locking on state files.** If you run two pi sessions against the same `~/.pi/` simultaneously, both schedulers can dispatch the same job (double-fire) and corrupt the JSONL state file. Single-session use is the supported configuration.
 
 ---
 
@@ -194,7 +207,7 @@ If pi makes breaking API changes in a 0.71.x or 1.0 release, you'll see a TypeSc
 
 ```bash
 npm install
-npm test          # 94 vitest tests, all pure functions + simulations
+npm test          # 109 vitest tests, all pure functions + simulations
 ```
 
 Tests cover:
@@ -207,6 +220,8 @@ Tests cover:
 - `prepareCronDispatch` — directory/empty/escape rejection
 - `shouldFire` — dedup window, regression test for the prior 59-min bug
 - `shouldCompactContext` — context cap policy
+- `findMostRecentDueMinute` + `floorToMinute` — catch-up scheduler (open-late, sleep/wake, sparse cron after long sleep)
+- `loadCronFile` / `findCronFiles` / `loadAllJobs` — hardening so one bad `.cron` entry doesn't kill loading
 - end-to-end SECURITY simulation — malicious local `.cron` blocked at every layer
 - end-to-end firing simulation — multi-tick dedup with `vi.useFakeTimers`
 

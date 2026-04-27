@@ -21,6 +21,9 @@ import {
 	compactJobHistory,
 	configHash,
 	discoverCronFiles,
+	FIRST_TIME_LOOKBACK_MS,
+	findMostRecentDueMinute,
+	floorToMinute,
 	getJobEntryCount,
 	getJobSessionPath,
 	getLastFireTime,
@@ -30,6 +33,7 @@ import {
 	loadAllJobs,
 	loadCronFile,
 	loadJobHistory,
+	MAX_LOOKBACK_MS,
 	matchesCron,
 	parseCronField,
 	prepareCronDispatch,
@@ -257,6 +261,34 @@ describe("loadCronFile", () => {
 	it("returns null on missing file", () => {
 		expect(loadCronFile(path.join(tmp, "ghost.cron"), "global")).toBeNull();
 	});
+
+	it("returns null (does NOT throw) when path is a directory (codex round-6)", () => {
+		const dirPath = path.join(tmp, "fakejob.cron");
+		fs.mkdirSync(dirPath);
+		expect(() => loadCronFile(dirPath, "global")).not.toThrow();
+		expect(loadCronFile(dirPath, "global")).toBeNull();
+	});
+
+	it("returns null (does NOT throw) when file is unreadable (codex round-6)", () => {
+		const file = path.join(tmp, "noperm.cron");
+		fs.writeFileSync(file, "name: x\nprompt: p.md\ncron: * * * * *\n");
+		fs.chmodSync(file, 0o000);
+		try {
+			// Skip this assertion when running as root (root can read any file
+			// regardless of mode bits, and the test container is rooted).
+			let canRead = true;
+			try {
+				fs.readFileSync(file, "utf-8");
+			} catch {
+				canRead = false;
+			}
+			if (canRead) return; // root context: EACCES not enforced
+			expect(() => loadCronFile(file, "global")).not.toThrow();
+			expect(loadCronFile(file, "global")).toBeNull();
+		} finally {
+			fs.chmodSync(file, 0o644);
+		}
+	});
 });
 
 describe("discoverCronFiles + loadAllJobs", () => {
@@ -301,6 +333,39 @@ describe("discoverCronFiles + loadAllJobs", () => {
 	it("returns empty list when neither dir exists", () => {
 		expect(discoverCronFiles(home, cwd)).toEqual([]);
 		expect(loadAllJobs(home, cwd)).toEqual([]);
+	});
+
+	it("discoverCronFiles skips directories that happen to end in .cron (codex round-6)", () => {
+		const cronD = path.join(home, ".pi", "cron.d");
+		fs.mkdirSync(cronD, { recursive: true });
+		// A real job
+		writeJob(home, "real.cron", "real");
+		// A directory named like a cron file - must be skipped, not crash later
+		fs.mkdirSync(path.join(cronD, "trap.cron"));
+
+		const files = discoverCronFiles(home, cwd);
+		expect(files.map((f) => path.basename(f.path)).sort()).toEqual(["real.cron"]);
+	});
+
+	it("loadAllJobs continues past one bad entry (codex round-6 finding)", () => {
+		writeJob(home, "good.cron", "good");
+		// Plant a malformed file that will be discovered but fail to parse
+		// (missing required fields).
+		const cronD = path.join(home, ".pi", "cron.d");
+		fs.writeFileSync(path.join(cronD, "bad.cron"), "this is not a valid cron file at all\n");
+
+		const jobs = loadAllJobs(home, cwd);
+		expect(jobs.map((j) => j.name)).toEqual(["good"]);
+	});
+
+	it("loadAllJobs survives a directory entry inside cron.d (regression)", () => {
+		writeJob(home, "good.cron", "good");
+		const cronD = path.join(home, ".pi", "cron.d");
+		fs.mkdirSync(path.join(cronD, "trap.cron"));
+
+		const jobs = loadAllJobs(home, cwd);
+		expect(jobs).toHaveLength(1);
+		expect(jobs[0].name).toBe("good");
 	});
 });
 
@@ -469,6 +534,144 @@ describe("compactJobHistory", () => {
 		expect(out[0].summary).toContain("COMPACTED 9 entries");
 		expect(out.slice(1).map((e) => e.prompt)).toEqual(["p9", "p10", "p11"]);
 		expect(loadJobHistory(eps, stateDir)).toEqual(out);
+	});
+});
+
+// =============================================================================
+// floorToMinute + findMostRecentDueMinute — catch-up scheduler
+// (codex round-6 finding: missed minute boundaries on sleep/wake/late-start)
+// =============================================================================
+
+describe("floorToMinute", () => {
+	it("strips seconds and milliseconds", () => {
+		const d = new Date(2026, 3, 27, 14, 30, 45, 123);
+		const f = floorToMinute(d);
+		expect(f.getSeconds()).toBe(0);
+		expect(f.getMilliseconds()).toBe(0);
+		expect(f.getMinutes()).toBe(30);
+		expect(f.getHours()).toBe(14);
+	});
+
+	it("does not mutate input", () => {
+		const d = new Date(2026, 3, 27, 14, 30, 45);
+		const original = d.getTime();
+		floorToMinute(d);
+		expect(d.getTime()).toBe(original);
+	});
+});
+
+describe("findMostRecentDueMinute", () => {
+	const everyMinute = makeJob({ name: "every", cronExpression: "* * * * *" });
+	const noonOnly = makeJob({ name: "noon", cronExpression: "0 12 * * *" });
+	const hourly = makeJob({ name: "hourly", cronExpression: "0 * * * *" });
+	const february30 = makeJob({ name: "never", cronExpression: "0 0 30 2 *" });
+
+	const at = (h: number, m: number, s = 0) => new Date(2026, 3, 27, h, m, s);
+
+	it("never-fired job: returns now when current minute matches", () => {
+		const now = at(12, 0, 30);
+		const loadMs = at(12, 0, 0).getTime();
+		const r = findMostRecentDueMinute(noonOnly, now, null, loadMs);
+		expect(r).not.toBeNull();
+		expect(r?.getHours()).toBe(12);
+		expect(r?.getMinutes()).toBe(0);
+	});
+
+	it("never-fired job: catches a 3-minute-old matching minute (within 5min lookback)", () => {
+		const now = at(12, 3, 0);
+		const loadMs = at(12, 0, 0).getTime();
+		const r = findMostRecentDueMinute(noonOnly, now, null, loadMs);
+		expect(r).not.toBeNull();
+		expect(r?.getHours()).toBe(12);
+		expect(r?.getMinutes()).toBe(0);
+	});
+
+	it("never-fired job: returns null for a 30-minute-old match (outside 5min lookback)", () => {
+		const now = at(12, 30, 0);
+		const loadMs = at(12, 0, 0).getTime();
+		const r = findMostRecentDueMinute(noonOnly, now, null, loadMs);
+		expect(r).toBeNull();
+	});
+
+	it("never-fired job: respects the extensionLoadMs floor (no firing pre-load schedules)", () => {
+		// Match was at 11:55, but extension only loaded at 11:58, so the
+		// matching minute is BEFORE the extension was running. Don't fire.
+		const before = makeJob({ name: "before", cronExpression: "55 11 * * *" });
+		const now = at(11, 59, 0);
+		const loadMs = at(11, 58, 0).getTime();
+		const r = findMostRecentDueMinute(before, now, null, loadMs);
+		expect(r).toBeNull();
+	});
+
+	it("previously-fired job: catches up to 24h old matches", () => {
+		const now = at(12, 30, 0);
+		// Last fire was a long time ago - 25 hours. The 12:00 match today is
+		// within the 24h lookback window, so we expect a catch-up fire.
+		const lastFire = now.getTime() - 25 * 60 * 60 * 1000;
+		const loadMs = lastFire; // doesn't matter for previously-fired path
+		const r = findMostRecentDueMinute(noonOnly, now, lastFire, loadMs);
+		expect(r).not.toBeNull();
+		expect(r?.getHours()).toBe(12);
+		expect(r?.getMinutes()).toBe(0);
+	});
+
+	it("previously-fired job: respects the dedup window after a recent fire", () => {
+		const now = at(12, 0, 30);
+		// Fired 30 seconds ago - within the 60s dedup window, should NOT re-fire.
+		const lastFire = now.getTime() - 30_000;
+		const r = findMostRecentDueMinute(everyMinute, now, lastFire, 0);
+		expect(r).toBeNull();
+	});
+
+	it("previously-fired job: fires again once dedup window elapses", () => {
+		const now = at(12, 1, 30);
+		const lastFire = at(12, 0, 0).getTime(); // 90s ago
+		const r = findMostRecentDueMinute(everyMinute, now, lastFire, 0);
+		expect(r).not.toBeNull();
+	});
+
+	it("never-matching expression returns null even with infinite lookback", () => {
+		const now = at(12, 0);
+		const r = findMostRecentDueMinute(february30, now, null, 0);
+		expect(r).toBeNull();
+	});
+
+	it("hourly cron after a 90-minute sleep: returns most recent hourly slot", () => {
+		// Sleep started after firing at 11:00. Wake at 12:30. Should fire 12:00.
+		const lastFire = at(11, 0, 0).getTime();
+		const now = at(12, 30, 0);
+		const r = findMostRecentDueMinute(hourly, now, lastFire, lastFire);
+		expect(r).not.toBeNull();
+		expect(r?.getHours()).toBe(12);
+		expect(r?.getMinutes()).toBe(0);
+	});
+
+	it("frequent cron after a long sleep: fires once at most-recent matching minute, not N times", () => {
+		// `* * * * *` sleeping for 30 min should NOT fire 30 times - it should
+		// return ONE matching minute. Caller fires once.
+		const lastFire = at(12, 0, 0).getTime();
+		const now = at(12, 30, 0);
+		const r = findMostRecentDueMinute(everyMinute, now, lastFire, lastFire);
+		expect(r).not.toBeNull();
+		// Most recent matching minute is 12:30 itself
+		expect(r?.getHours()).toBe(12);
+		expect(r?.getMinutes()).toBe(30);
+	});
+
+	it("performance: walking 24h of minutes for a never-matching cron is fast", () => {
+		const now = at(12, 0);
+		const lastFire = now.getTime() - MAX_LOOKBACK_MS;
+		const t0 = Date.now();
+		const r = findMostRecentDueMinute(february30, now, lastFire, lastFire);
+		const elapsed = Date.now() - t0;
+		expect(r).toBeNull();
+		// 1440 matchesCron calls. Should complete in well under a second.
+		expect(elapsed).toBeLessThan(500);
+	});
+
+	it("constants are sane", () => {
+		expect(FIRST_TIME_LOOKBACK_MS).toBe(5 * 60 * 1000);
+		expect(MAX_LOOKBACK_MS).toBe(24 * 60 * 60 * 1000);
 	});
 });
 
@@ -926,6 +1129,7 @@ describe("send-then-persist ordering", () => {
 		expect(getLastFireTime(job, stateDir)).toBeNull();
 	});
 });
+
 
 // =============================================================================
 // End-to-end firing simulation — composes the same exported functions the

@@ -220,11 +220,23 @@ export function matchesCron(expression: string, now: Date): boolean {
 /**
  * Parse a `.cron` file. `source` and the absolute file path are stamped onto
  * the resulting job so downstream code can apply trust + collision rules.
+ *
+ * Returns null on any failure (missing file, EACCES, directory passed as
+ * filePath, malformed content, missing required field). Never throws. This
+ * matters because one bad `.cron` entry must not abort `loadAllJobs()` and
+ * leave the whole scheduler dark for the session. (codex round-6 finding.)
  */
 export function loadCronFile(filePath: string, source: JobSource): CronJob | null {
 	if (!existsSync(filePath)) return null;
 
-	const content = readFileSync(filePath, "utf-8");
+	let content: string;
+	try {
+		content = readFileSync(filePath, "utf-8");
+	} catch {
+		// Directory at this path, EACCES, broken symlink, non-utf8 bytes, etc.
+		return null;
+	}
+
 	let name: string | undefined;
 	let promptPath: string | undefined;
 	let cronExpression: string | undefined;
@@ -253,9 +265,12 @@ export function loadCronFile(filePath: string, source: JobSource): CronJob | nul
 function findCronFiles(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 	try {
-		return readdirSync(dir)
-			.filter((f) => f.endsWith(".cron"))
-			.map((f) => join(dir, f));
+		// withFileTypes lets us drop directories and special files BEFORE we try
+		// to read them. A directory like `mydir.cron` would otherwise crash the
+		// loader on readFileSync.
+		return readdirSync(dir, { withFileTypes: true })
+			.filter((d) => d.isFile() && d.name.endsWith(".cron"))
+			.map((d) => join(dir, d.name));
 	} catch {
 		return [];
 	}
@@ -387,6 +402,64 @@ export function getJobEntryCount(job: JobIdentity, baseDir: string = DEFAULT_STA
 // ============================================================================
 
 export const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+
+// ----------------------------------------------------------------------------
+// Catch-up scheduler
+//
+// The naive "evaluate matchesCron at callback time" strategy silently misses
+// any minute boundary that the timer drifts past (laptop sleep, event-loop
+// stall, session_start at HH:00:05 etc). The catch-up scheduler walks back
+// minute-by-minute from `now` to the most recent matching minute, bounded by
+// (a) the job's last-fire timestamp (no double-fire) and (b) a perf cap.
+//
+// For never-fired jobs we use a much shorter floor (FIRST_TIME_LOOKBACK_MS)
+// and don't go before extensionLoadMs - we don't want to dredge up a stale
+// schedule from before the extension loaded and surprise the user.
+// (codex round-6 finding.)
+// ----------------------------------------------------------------------------
+
+export const MAX_LOOKBACK_MS = 24 * 60 * 60 * 1000; // 24h: covers daily crons across overnight sleep
+export const FIRST_TIME_LOOKBACK_MS = 5 * 60 * 1000; // 5m: covers "opened pi a few seconds late"
+
+/** Floor a Date to the start of its minute. */
+export function floorToMinute(d: Date): Date {
+	const f = new Date(d);
+	f.setSeconds(0, 0);
+	return f;
+}
+
+/**
+ * Find the most recent minute (≤ now) where the job's cron expression matches
+ * AND the dedup/lookback bounds permit firing. Returns null if no such minute
+ * exists in the allowed window. Pure - easy to unit-test against synthetic clocks.
+ *
+ * Lower-bound logic:
+ *   - never-fired job: max(now - 5min, extensionLoadMs) - small catch-up only
+ *   - previously-fired:  max(now - 24h, lastFire + dedup) - perf cap + dedup
+ */
+export function findMostRecentDueMinute(
+	job: CronJob,
+	now: Date,
+	lastFireMs: number | null,
+	extensionLoadMs: number,
+	dedupWindowMs: number = DEFAULT_DEDUP_WINDOW_MS,
+): Date | null {
+	const nowMs = now.getTime();
+	let lowerBoundMs: number;
+	if (lastFireMs !== null) {
+		lowerBoundMs = Math.max(nowMs - MAX_LOOKBACK_MS, lastFireMs + dedupWindowMs);
+	} else {
+		lowerBoundMs = Math.max(nowMs - FIRST_TIME_LOOKBACK_MS, extensionLoadMs);
+	}
+	if (lowerBoundMs > nowMs) return null;
+
+	let cursor = floorToMinute(now);
+	while (cursor.getTime() >= lowerBoundMs) {
+		if (matchesCron(job.cronExpression, cursor)) return cursor;
+		cursor = new Date(cursor.getTime() - 60_000);
+	}
+	return null;
+}
 
 /**
  * Default context-usage cap for pi's main session. When a cron fires and the
@@ -574,11 +647,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let lastCtx: ExtensionContext | null = null;
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let cwdDir = process.cwd();
+	let extensionLoadMs = Date.now();
 	const homeDir = homedir() || "";
 	const stateDir = join(homeDir, ".pi", "cron");
 
 	/**
-	 * Dispatch a single due job. Returns true if a sendUserMessage call was made.
+	 * Dispatch a single due job for the given matched minute. Returns true if a
+	 * sendUserMessage call was made.
+	 *
+	 * `matchedAt` is the wall-clock minute the cron expression matched - it may
+	 * be earlier than `Date.now()` if we're catching up after a sleep/wake or
+	 * delayed tick. The persisted fire timestamp is `Date.now()` (real wall
+	 * clock when we dispatched), so dedup uses real elapsed time.
 	 *
 	 * Crash safety: the caller wraps this in try/catch so any unforeseen throw
 	 * just aborts this one job and notifies the user, instead of escaping the
@@ -593,9 +673,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	 * already delivered, so the only consequence is that the next tick may
 	 * re-fire (better than silently missing).
 	 */
-	function fireOneJob(job: CronJob, now: Date, ctx: ExtensionContext, alreadyDispatched: boolean): boolean {
-		const lastFire = getLastFireTime(job, stateDir);
-		if (!shouldFire(job, now, lastFire)) return false;
+	function fireOneJob(job: CronJob, matchedAt: Date, ctx: ExtensionContext, alreadyDispatched: boolean): boolean {
+		// Note: the caller (checkAndFireJobs) has already determined this job is
+		// due via findMostRecentDueMinute, which encapsulates dedup + lookback.
+		// We don't re-check shouldFire here.
+		void matchedAt; // currently used only for the notify message; keep for future logging
 
 		// Preflight: skip if no model is configured. sendUserMessage is fire-
 		// and-forget, so without this preflight a missing model would cause
@@ -676,7 +758,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		let dispatchedThisTick = false;
 		for (const job of jobs) {
 			try {
-				if (fireOneJob(job, now, ctx, dispatchedThisTick)) {
+				const lastFire = getLastFireTime(job, stateDir);
+				const matchedAt = findMostRecentDueMinute(job, now, lastFire, extensionLoadMs);
+				if (!matchedAt) continue;
+				if (fireOneJob(job, matchedAt, ctx, dispatchedThisTick)) {
 					dispatchedThisTick = true;
 				}
 			} catch (err) {
@@ -692,17 +777,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
 		cwdDir = ctx.cwd;
+		extensionLoadMs = Date.now();
 		jobs = loadAllJobs(homeDir, cwdDir);
 
 		if (timer) clearInterval(timer);
 		timer = setInterval(checkAndFireJobs, CHECK_INTERVAL_MS);
-		// We deliberately do NOT call checkAndFireJobs() here. Earlier versions
-		// did to "catch up" jobs whose matching minute coincided with session
-		// start, but in practice this races with pi's own user-message dispatch
-		// (especially in print mode, where the user prompt is in flight at
-		// session_start) and produces "Agent is already processing" errors. The
-		// first timer tick lands within ≤60s; for a wall-clock scheduler that's
-		// fine, and it's uniformly safer than fighting the dispatch race.
+		// We do NOT call checkAndFireJobs() here. Earlier versions did to "catch
+		// up" jobs whose matching minute coincided with session_start, but in
+		// practice that races with pi's own user-message dispatch (especially in
+		// print mode where the user prompt is in flight at session_start) and
+		// produces "Agent is already processing" errors. The first timer tick
+		// lands within ≤60s, and findMostRecentDueMinute will catch up any
+		// matching minute that drifted past session_start - so this delay
+		// doesn't lose schedules, it just defers the first fire by a minute.
 
 		if (ctx.hasUI) {
 			const globalCount = jobs.filter((j) => j.source === "global").length;
@@ -711,6 +798,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				`Cron extension loaded: ${jobs.length} job(s) (${globalCount} global, ${localCount} local).`,
 				"info",
 			);
+
+			// Surface .cron files that failed to load so a malformed entry doesn't
+			// vanish silently. (codex round-6 finding.)
+			const allDiscovered = discoverCronFiles(homeDir, cwdDir);
+			const loadedConfigFiles = new Set(jobs.map((j) => j.configFile));
+			const failedPaths = allDiscovered.filter((d) => !loadedConfigFiles.has(d.path)).map((d) => d.path);
+			if (failedPaths.length > 0) {
+				ctx.ui.notify(
+					`Cron: ${failedPaths.length} .cron file(s) failed to load (missing required field, unreadable, or malformed): ${failedPaths.join(", ")}`,
+					"warning",
+				);
+			}
 		}
 	});
 
